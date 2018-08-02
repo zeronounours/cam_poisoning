@@ -5,28 +5,26 @@ A list of remaining things to do
 
 * Improve the logger to redirect to file
 
-* Don't queue unicast ethernet frames to the current interface
+* Don't queue unicast Ethernet frames to the current interface
   - Move it to the queuing function. Currently message can be queued in
   restore_mac_callback
 
-* Don't queue broadcast & multicast ethernet frames
+* Don't queue broadcast & multicast Ethernet frames
   - Only queue message whose MAC is in the cache
   - Move it to the queuing function. Currently message can be queued in
   restore_mac_callback
 
-* Update the ARP cache based on gratiutous ARP
+* Update the ARP cache based on gratuitous ARP
 
-* Don't send asynchronous CAM restoration frame for intercepted hosts
-
-* Force re-poisoning of hosts when a frame is received from one of them
+* Switch UNIX socket to SOCK_SEQPACKET
 
 * In the restore_mac_callback, ensure that packets which must intercepted are
 sent through the IPC instead of being queued
 
-* Multi-thread the poisoning for effeciency. Currently on retransmission,
+* Multi-thread the poisoning for efficiency. Currently on retransmission,
 the main thread may be blocked for 750ms if it doesn't succeed in restoring the
 CAM tables; meanwhile, poisoning doesn't happen anymore. Can have
-  - one thread to retransmit not-targetted frames asynchronously
+  - one thread to retransmit not-targeted frames asynchronously
   - one thread to poison and retransmit from time to time
 
 
@@ -46,5 +44,5 @@ because it may allow unprivileged users to inject raw packet
     * retrieve local cache
     * stealth: wait for broadcasted ARP requests
     * semi-stealth: increase time between each ARP requests
-    * user-input: cache given through commandline
+    * user-input: cache given through command line
 

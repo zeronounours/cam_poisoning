@@ -38,18 +38,22 @@ int inline queue_message(struct queue *q, void *buf, size_t buflen);
 int inline free_queue(struct queue *q);
 */
 
-// structure for callback arg
-struct cb_args {
+// structure to store poisoning data
+struct poison_info {
 	struct queue *queue;
-	union {
-		struct in_addr *ip;
-		struct {
-			uint8_t *h1;
-			uint8_t *h2;
-			uint8_t *local;
-			struct ipc *ipc;
-		};
-	};
+
+	struct ipc *ipc;
+	int sock;
+
+	struct iface *iface;
+	uint8_t *h1;
+	uint8_t *h2;
+};
+
+// structure to pass arguments to callbacks
+struct cb_args {
+	struct poison_info *info;
+	void *extra;
 };
 
 #define ARP_RESTORE_TIMEOUT 250			// in ms

