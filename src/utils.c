@@ -81,7 +81,7 @@ int recvfrom_multiple_with_timeout(int epollfd, const int timeout,
 
 	uint8_t res[MAX_PKT_SIZE];
 	ssize_t res_l;
-	struct sockaddr addr = {0};
+	struct sockaddr_storage addr = {0};
 	socklen_t addr_l = sizeof(addr);
 
 	struct timespec current_t, start_t;
@@ -102,7 +102,7 @@ int recvfrom_multiple_with_timeout(int epollfd, const int timeout,
 	// read response when available
 	while (1) {
 		// poll all given fd
-		nfds = epoll_wait(epollfd, events, MAX_EVENTS, timeout);
+		nfds = epoll_wait(epollfd, events, MAX_EVENTS, remaining_t);
 
 		// handle case of timeout & errors
 		if (nfds == -1) {
@@ -115,8 +115,8 @@ int recvfrom_multiple_with_timeout(int epollfd, const int timeout,
 
 		// read all available fd
 		for (i=0; i<nfds; i++) {
-			res_l = recvfrom(events[i].data.fd,
-					&res, sizeof(res), 0, &addr, &addr_l);
+			res_l = recvfrom(events[i].data.fd, &res, sizeof(res),
+					0, (struct sockaddr *)&addr, &addr_l);
 
 			// handle errors
 			if (res_l == -1) {
@@ -125,7 +125,8 @@ int recvfrom_multiple_with_timeout(int epollfd, const int timeout,
 			}
 
 			// delegate to the callback
-			if (callback(&res, res_l, &addr, addr_l, args)) {
+			if (callback(&res, res_l, (struct sockaddr *) &addr,
+						addr_l, args)) {
 				// the callback return something different to 0, stop here
 				log_debug("Receive loop interrupted\n");
 				return 1;
@@ -138,8 +139,11 @@ int recvfrom_multiple_with_timeout(int epollfd, const int timeout,
 			return -1;
 		}
 		remaining_t = timeout - TS_DIFF_IN_MS(current_t, start_t);
-		if (remaining_t < 0)
-			remaining_t = 0;
+		if (remaining_t < 0) {
+			// timeout
+			return 0;
+		}
+		log_debug("%ims left to receive data\n", remaining_t);
 
 	}
 	// never reached
