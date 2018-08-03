@@ -136,6 +136,58 @@ int static inline poison_mac(struct poison_info *info, uint8_t mac[ETH_ALEN]) {
 	return 1;
 }
 
+/**
+ * This inline funtion is used by both callbacks (receive_messages_callback and
+ * and restore_mac_callback) to unify the treatment of packets received through
+ * the network interface.
+ */
+void static inline treat_received_message(struct poison_info *info,
+		void *buf, ssize_t buflen) {
+
+	struct ether_header *eh = (struct ether_header *)buf;
+	if (buflen >= sizeof(struct ether_header)) {	// prevent OOB read
+
+		log_debug("New message from network interface: "
+				"%02x:%02x:%02x:%02x:%02x:%02x -> "
+				"%02x:%02x:%02x:%02x:%02x:%02x [%04x]\n",
+				eh->ether_shost[0], eh->ether_shost[1],
+				eh->ether_shost[2], eh->ether_shost[3],
+				eh->ether_shost[4], eh->ether_shost[5],
+				eh->ether_dhost[0], eh->ether_dhost[1],
+				eh->ether_dhost[2], eh->ether_dhost[3],
+				eh->ether_dhost[4], eh->ether_dhost[5],
+				ntohs(eh->ether_type));
+
+		// Check the source address and re-poison if it comes from one of
+		// the intercepted hosts
+		if (ETHER_CMP(eh->ether_shost, info->h1) ||
+				ETHER_CMP(eh->ether_shost, info->h2)) {
+			poison_mac(info, eh->ether_shost);
+		}
+
+		// If the frame goes to one of the hosts, we send the frame
+		// through the IPC.
+		// If it goes to the local interface, we dont treat it
+		// Else we queue it for later retransmission
+		if (ETHER_CMP(eh->ether_dhost, info->h1) ||
+				ETHER_CMP(eh->ether_dhost, info->h2)) {
+			// send through IPC
+			if (sendto_ipc(info->ipc, buf, buflen) == -1) {
+				perror("Failed to send frame through IPC");
+			}
+		} else if (ETHER_CMP(eh->ether_dhost, info->iface->hwaddr)) {
+			log_debug("Frame for the local interface discarded\n");
+		} else {
+			// other Ethernet frame => queue if its a unicast frame
+			if ((eh->ether_dhost[0] & 0x01) == 0x00) {
+				queue_message(info->queue, buf, buflen);
+			} else {
+				log_debug("Multicast ethernet frame discarded\n");
+			}
+		}
+	}
+}
+
 int static inline receive_messages(int epollfd, struct poison_info *info,
 		int duration) {
 
@@ -184,51 +236,11 @@ int receive_messages_callback(void *buf, ssize_t buflen,
 		}
 	} else if (addr->sa_family == AF_PACKET) {	// received from the network
 		// cast to ethernet frame
-		struct ether_header *eh = (struct ether_header *)buf;
 		struct sockaddr_ll *recvaddr = (struct sockaddr_ll *)addr;
 
-		// Only treat incoming ethernet frames
-		if (recvaddr->sll_pkttype != PACKET_OUTGOING &&
-				buflen >= sizeof(struct ether_header)) {	// prevent OOB read
-
-			log_debug("New message from network interface: "
-					"%02x:%02x:%02x:%02x:%02x:%02x -> "
-					"%02x:%02x:%02x:%02x:%02x:%02x [%04x]\n",
-					eh->ether_shost[0], eh->ether_shost[1],
-					eh->ether_shost[2], eh->ether_shost[3],
-					eh->ether_shost[4], eh->ether_shost[5],
-					eh->ether_dhost[0], eh->ether_dhost[1],
-					eh->ether_dhost[2], eh->ether_dhost[3],
-					eh->ether_dhost[4], eh->ether_dhost[5],
-					ntohs(eh->ether_type));
-
-			// Check the source address and re-poison if it comes from one of
-			// the intercepted hosts
-			if (ETHER_CMP(eh->ether_shost, info->h1) ||
-					ETHER_CMP(eh->ether_shost, info->h2)) {
-				poison_mac(info, eh->ether_shost);
-			}
-
-			// If the frame goes to one of the hosts, we send the frame
-			// through the IPC.
-			// If it goes to the local interface, we dont treat it
-			// Else we queue it for later retransmission
-			if (ETHER_CMP(eh->ether_dhost, info->h1) ||
-					ETHER_CMP(eh->ether_dhost, info->h2)) {
-				// send through IPC
-				if (sendto_ipc(info->ipc, buf, buflen) == -1) {
-					perror("Failed to send frame through IPC");
-				}
-			} else if (ETHER_CMP(eh->ether_dhost, info->iface->hwaddr)) {
-				log_debug("Frame for the local interface discarded\n");
-			} else {
-				// other Ethernet frame => queue if its a unicast frame
-				if ((eh->ether_dhost[0] & 0x01) == 0x00) {
-					queue_message(info->queue, buf, buflen);
-				} else {
-					log_debug("Multicast ethernet frame discarded\n");
-				}
-			}
+		// Only treat incoming frames
+		if (recvaddr->sll_pkttype != PACKET_OUTGOING) {
+			treat_received_message(info, buf, buflen);
 		}
 	}
 	return 0;	// continue the recvfrom loop
@@ -358,8 +370,8 @@ int restore_mac_callback(void *buf, ssize_t buflen,
 				return 1;
 			}
 		} else {
-			// other Ethernet frame => just queue it
-			queue_message(info->queue, buf, buflen);
+			// other Ethernet frame => just treat it with the unified method
+			treat_received_message(info, buf, buflen);
 		}
 	}
 	return 0;	// continue the recvfrom loop

@@ -5,14 +5,7 @@ A list of remaining things to do
 
 * Improve the logger to redirect to file
 
-* Don't queue unicast Ethernet frames to the current interface
-  - Move it to the queuing function. Currently message can be queued in
-  restore_mac_callback
-
-* Don't queue broadcast & multicast Ethernet frames
-  - Only queue message whose MAC is in the cache
-  - Move it to the queuing function. Currently message can be queued in
-  restore_mac_callback
+* Improve documentation
 
 * Update the ARP cache based on gratuitous ARP
 
