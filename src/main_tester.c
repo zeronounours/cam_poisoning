@@ -33,12 +33,14 @@ static char doc[] =
 
 static char args_doc[] = "";
 static struct argp_option options[] = {
+	{ "open",	'o',	0,			0,	"Do not relay any frame"},
 	{ "verbose",	'v',	0,			0,	"Produce verbose output"},
 	{ 0 }
 };
 
 struct arguments {
 	int verbose;
+	int opened;
 };
 
 /*
@@ -49,6 +51,10 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 	switch (key) {
 		case 'v':
 			arguments->verbose = 1;
+			break;
+
+		case 'o':
+			arguments->opened= 1;
 			break;
 
 		case ARGP_KEY_ARG:
@@ -192,7 +198,7 @@ int main(int argc, char *argv[]) {
 			}
 
 			// Send the packet back
-			if (sendto(ipc, buf, buflen, 0,
+			if (!args.opened && sendto(ipc, buf, buflen, 0,
 						(struct sockaddr *)&claddr, claddr_l) == -1) {
 				if (!args.verbose)
 					printf("\n");
